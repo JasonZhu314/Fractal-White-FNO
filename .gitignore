@@ -205,3 +205,23 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# ===== Project-specific =====
+
+# Windows crash dumps
+bash.exe.stackdump
+
+# Model checkpoints
+*.pth
+
+# Data files (large, download separately)
+data/burgers/
+data/raw/
+data/processed/
+
+# Training outputs (plots, logs)
+outputs/
+
+# Project planning docs and reference papers (not code)
+plan/
+reference/
