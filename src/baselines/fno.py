@@ -2,58 +2,12 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim import Adam
+from src.utils.losses import LpLoss
+from src.utils.normalizer import UnitGaussianNormalizer
+from timeit import default_timer
 
 ## FNO 1D and 2D
-
-
-class LpLoss(object):
-    """
-    loss function with rel/abs Lp loss
-    """
-
-    def __init__(self, p=2, size_average=True, reduction=True):
-        super(LpLoss, self).__init__()
-
-        # Dimension and Lp-norm type are postive
-        assert p > 0
-
-        self.p = p
-        self.reduction = reduction
-        self.size_average = size_average
-
-    def abs(self, x, y):
-        num_examples = x.size()[0]
-
-        all_norms = torch.norm(
-            x.view(num_examples, -1) - y.view(num_examples, -1), self.p, 1
-        )
-
-        if self.reduction:
-            if self.size_average:
-                return torch.mean(all_norms)
-            else:
-                return torch.sum(all_norms)
-
-        return all_norms
-
-    def rel(self, x, y):
-        num_examples = x.size()[0]
-
-        diff_norms = torch.norm(
-            x.reshape(num_examples, -1) - y.reshape(num_examples, -1), self.p, 1
-        )
-        y_norms = torch.norm(y.reshape(num_examples, -1), self.p, 1)
-
-        if self.reduction:
-            if self.size_average:
-                return torch.mean(diff_norms / y_norms)
-            else:
-                return torch.sum(diff_norms / y_norms)
-
-        return diff_norms / y_norms
-
-    def __call__(self, x, y):
-        return self.rel(x, y)
 
 
 def add_padding(x, pad_nums):
@@ -149,7 +103,7 @@ class SpectralConv1d(nn.Module):
         super(SpectralConv1d, self).__init__()
 
         """
-        1D Fourier layer. It does FFT, linear transform, and Inverse FFT.    
+        1D Fourier layer. It does FFT, linear transform, and Inverse FFT.
         """
 
         self.in_channels = in_channels
@@ -254,7 +208,6 @@ class FNO1d(nn.Module):
         act="gelu",
         pad_ratio=0,
         cnn_kernel_size=1,
-        increment=False,
     ):
         super(FNO1d, self).__init__()
 
@@ -274,18 +227,20 @@ class FNO1d(nn.Module):
         self.modes1 = modes
         self.width = width
         if layers is None:
-            layers = [width] * 4
+            self.layers = [width] * 4
         else:
             self.layers = layers
         self.pad_ratio = pad_ratio
         self.fc_dim = fc_dim
 
-        self.fc0 = nn.Linear(in_dim, layers[0])  # input channel is 2: (a(x), x)
+        self.fc0 = nn.Linear(in_dim, self.layers[0])  # input channel is 2: (a(x), x)
 
         self.sp_convs = nn.ModuleList(
             [
                 SpectralConv1d(in_size, out_size, num_modes)
-                for in_size, out_size, num_modes in zip(layers, layers[1:], self.modes1)
+                for in_size, out_size, num_modes in zip(
+                    self.layers, self.layers[1:], self.modes1
+                )
             ]
         )
 
@@ -297,19 +252,18 @@ class FNO1d(nn.Module):
                     kernel_size=cnn_kernel_size,
                     padding=(cnn_kernel_size // 2),
                 )
-                for in_size, out_size in zip(layers, layers[1:])
+                for in_size, out_size in zip(self.layers, self.layers[1:])
             ]
         )
 
         # if fc_dim = 0, we do not have nonlinear layer
         if fc_dim > 0:
-            self.fc1 = nn.Linear(layers[-1], fc_dim)
+            self.fc1 = nn.Linear(self.layers[-1], fc_dim)
             self.fc2 = nn.Linear(fc_dim, out_dim)
         else:
-            self.fc2 = nn.Linear(layers[-1], out_dim)
+            self.fc2 = nn.Linear(self.layers[-1], out_dim)
 
         self.act = _get_act(act)
-        self.increment = increment
 
     def forward(self, x):
         """
@@ -319,8 +273,6 @@ class FNO1d(nn.Module):
         The input resolution is determined by x.shape[-1]
         The output resolution is determined by self.s_outputspace
         """
-        increment = self.increment
-        input_identity = x  # last channel is time
 
         length = len(self.ws)
         x = self.fc0(x)
@@ -333,10 +285,10 @@ class FNO1d(nn.Module):
         for i, (speconv, w) in enumerate(zip(self.sp_convs, self.ws)):
             x1 = speconv(x)
             x2 = w(x)
+            x = x1 + x2
             if self.act is not None and i != length - 1:
-                x = self.act(x1 + x2)
-            else:
-                x = x1 + x2
+                x = self.act(x)
+
         # remove padding
         x = remove_padding(x, pad_nums=pad_nums)
 
@@ -352,7 +304,7 @@ class FNO1d(nn.Module):
 
         x = self.fc2(x)
 
-        return input_identity[..., : x.shape[-1]] + x if increment else x
+        return x
 
 
 class FNO2d(nn.Module):
@@ -377,10 +329,10 @@ class FNO2d(nn.Module):
         2. 4 layers of the integral operators u' = (W + K)(u).
             W defined by self.w; K defined by self.conv .
         3. Project from the channel space to the output space by self.fc1 and self.fc2 .
-        
+
         input: the solution of the coefficient function and locations (a(x, y), x, y)
         input shape: (batchsize, x=s, y=s, c=3)
-        output: the solution 
+        output: the solution
         output shape: (batchsize, x=s, y=s, c=1)
         """
 
@@ -395,7 +347,7 @@ class FNO2d(nn.Module):
         self.pad_ratio = pad_ratio
         self.fc_dim = fc_dim
 
-        self.fc0 = nn.Linear(in_dim, layers[0])
+        self.fc0 = nn.Linear(in_dim, self.layers[0])
 
         self.sp_convs = nn.ModuleList(
             [
@@ -408,8 +360,6 @@ class FNO2d(nn.Module):
 
         self.ws = nn.ModuleList(
             [
-                # nn.Conv1d(in_size, out_size, 1)
-                # for in_size, out_size in zip(self.layers, self.layers[1:])
                 nn.Conv2d(
                     in_size,
                     out_size,
@@ -421,10 +371,10 @@ class FNO2d(nn.Module):
         )
 
         if fc_dim > 0:
-            self.fc1 = nn.Linear(layers[-1], fc_dim)
+            self.fc1 = nn.Linear(self.layers[-1], fc_dim)
             self.fc2 = nn.Linear(fc_dim, out_dim)
         else:
-            self.fc2 = nn.Linear(layers[-1], out_dim)
+            self.fc2 = nn.Linear(self.layers[-1], out_dim)
 
         self.act = _get_act(act)
 
@@ -450,9 +400,6 @@ class FNO2d(nn.Module):
 
         for i, (speconv, w) in enumerate(zip(self.sp_convs, self.ws)):
             x1 = speconv(x)
-            # x2 = w(x.view(batchsize, self.layers[i], -1)).view(
-            #    batchsize, self.layers[i + 1], size_x, size_y
-            # )
             x2 = w(x)
             x = x1 + x2
             if self.act is not None and i != length - 1:
@@ -472,68 +419,72 @@ class FNO2d(nn.Module):
 
 
 # x_train, y_train, x_test, y_test are [n_data, n_x, n_channel] arrays
-def FNO_train(
-    x_train, y_train, x_test, y_test, config, model, save_model_name="./FNO_model"
-):
+def FNO_train(x_train, y_train, x_test, y_test, config, model, save_model_name="./FNO_model"):
     n_train, n_test = x_train.shape[0], x_test.shape[0]
     train_rel_l2_losses = []
     test_rel_l2_losses = []
     test_l2_losses = []
+    normalization_x = config["train"]["normalization_x"]
+    normalization_y = config["train"]["normalization_y"]
+    normalization_dim_x = config["train"]["normalization_dim_x"]
+    normalization_dim_y = config["train"]["normalization_dim_y"]
+    non_normalized_dim_x = config["train"]["non_normalized_dim_x"]
+    non_normalized_dim_y = config["train"]["non_normalized_dim_y"]
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if normalization_x:
+        x_normalizer = UnitGaussianNormalizer(
+            x_train, non_normalized_dim=non_normalized_dim_x, normalization_dim=normalization_dim_x)
+        x_train = x_normalizer.encode(x_train)
+        x_test = x_normalizer.encode(x_test)
+        x_normalizer.to(device)
+
+    if normalization_y:
+        y_normalizer = UnitGaussianNormalizer(
+            y_train, non_normalized_dim=non_normalized_dim_y, normalization_dim=normalization_dim_y)
+        y_train = y_normalizer.encode(y_train)
+        y_test = y_normalizer.encode(y_test)
+        y_normalizer.to(device)
 
     train_loader = torch.utils.data.DataLoader(
         torch.utils.data.TensorDataset(x_train, y_train),
-        batch_size=config["train"]["batch_size"],
-        shuffle=True,
-    )
+        batch_size=config['train']['batch_size'], shuffle=True)
     test_loader = torch.utils.data.DataLoader(
         torch.utils.data.TensorDataset(x_test, y_test),
-        batch_size=config["train"]["batch_size"],
-        shuffle=False,
-    )
+        batch_size=config['train']['batch_size'], shuffle=False)
 
-    # Load from checkpoint
-    optimizer = Adam(
-        model.parameters(),
-        betas=(0.9, 0.999),
-        lr=config["train"]["base_lr"],
-        weight_decay=config["train"]["weight_decay"],
-    )
+    optimizer = Adam(model.parameters(), betas=(0.9, 0.999),
+                     lr=config['train']['base_lr'], weight_decay=config['train']['weight_decay'])
 
-    if config["train"]["scheduler"] == "MultiStepLR":
+    if config["train"]["scheduler"] == "OneCycleLR":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=config['train']['base_lr'],
+            div_factor=2, final_div_factor=100, pct_start=0.2,
+            steps_per_epoch=len(train_loader), epochs=config['train']['epochs'])
+    elif config["train"]["scheduler"] == "MultiStepLR":
         scheduler = torch.optim.lr_scheduler.MultiStepLR(
             optimizer,
             milestones=config["train"]["milestones"],
-            gamma=config["train"]["scheduler_gamma"],
-        )
+            gamma=config["train"]["scheduler_gamma"])
     elif config["train"]["scheduler"] == "CosineAnnealingLR":
-        T_max = (config["train"]["epochs"] // 10) * (
-            n_train // config["train"]["batch_size"]
-        )
-        eta_min = 0.0
+        T_max = (config["train"]["epochs"] // 10) * (n_train // config["train"]["batch_size"])
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=T_max, eta_min=eta_min
-        )
-    elif config["train"]["scheduler"] == "OneCycleLR":
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=config["train"]["base_lr"],
-            div_factor=2,
-            final_div_factor=100,
-            pct_start=0.2,
-            steps_per_epoch=1,
-            epochs=config["train"]["epochs"],
-        )
+            optimizer, T_max=T_max, eta_min=0.0)
     else:
-        print("Scheduler ", config["train"]["scheduler"], " has not implemented.")
+        raise ValueError(f"Scheduler {config['train']['scheduler']} is not supported.")
+
+    step_per_batch = config["train"]["scheduler"] == "OneCycleLR"
 
     model.train()
     myloss = LpLoss(d=1, p=2, size_average=False)
 
-    epochs = config["train"]["epochs"]
+    epochs = config['train']['epochs']
+    print_every = max(1, epochs // 50)  # ~50 progress updates total
+    t_start = default_timer()
 
     for ep in range(epochs):
+        t1 = default_timer()
         train_rel_l2 = 0
 
         model.train()
@@ -542,7 +493,7 @@ def FNO_train(
 
             batch_size_ = x.shape[0]
             optimizer.zero_grad()
-            out = model(x)  # .reshape(batch_size_,  -1)
+            out = model(x)
             if normalization_y:
                 out = y_normalizer.decode(out)
                 y = y_normalizer.decode(y)
@@ -551,28 +502,28 @@ def FNO_train(
             loss.backward()
 
             optimizer.step()
+            if step_per_batch:
+                scheduler.step()
             train_rel_l2 += loss.item()
+
+        if not step_per_batch:
+            scheduler.step()
 
         test_l2 = 0
         test_rel_l2 = 0
+        model.eval()
         with torch.no_grad():
             for x, y in test_loader:
                 x, y = x.to(device), y.to(device)
                 batch_size_ = x.shape[0]
-                out = model(x)  # .reshape(batch_size_,  -1)
+                out = model(x)
 
                 if normalization_y:
                     out = y_normalizer.decode(out)
                     y = y_normalizer.decode(y)
 
-                test_rel_l2 += myloss(
-                    out.view(batch_size_, -1), y.view(batch_size_, -1)
-                ).item()
-                test_l2 += myloss.abs(
-                    out.view(batch_size_, -1), y.view(batch_size_, -1)
-                ).item()
-
-        scheduler.step()
+                test_rel_l2 += myloss(out.view(batch_size_, -1), y.view(batch_size_, -1)).item()
+                test_l2 += myloss.abs(out.view(batch_size_, -1), y.view(batch_size_, -1)).item()
 
         train_rel_l2 /= n_train
         test_l2 /= n_test
@@ -582,18 +533,18 @@ def FNO_train(
         test_rel_l2_losses.append(test_rel_l2)
         test_l2_losses.append(test_l2)
 
-        if (ep % 10 == 0) or (ep == epochs - 1):
-            print(
-                "Epoch : ",
-                ep,
-                " Rel. Train L2 Loss : ",
-                train_rel_l2,
-                " Rel. Test L2 Loss : ",
-                test_rel_l2,
-                " Test L2 Loss : ",
-                test_l2,
-                flush=True,
-            )
-            torch.save(model, save_model_name)
+        t2 = default_timer()
+        if (ep % print_every == 0) or (ep == epochs - 1):
+            elapsed = t2 - t_start
+            avg_per_epoch = elapsed / (ep + 1)
+            remaining = avg_per_epoch * (epochs - ep - 1)
+            mins_elapsed = elapsed / 60
+            mins_remaining = remaining / 60
+            print(f"[{ep+1}/{epochs}] "
+                  f"Train: {train_rel_l2:.6f}  Test: {test_rel_l2:.6f}  "
+                  f"({t2-t1:.1f}s/ep, {mins_elapsed:.1f}min elapsed, ~{mins_remaining:.1f}min left)",
+                  flush=True)
+            if save_model_name:
+                torch.save(model.state_dict(), save_model_name + ".pth")
 
     return train_rel_l2_losses, test_rel_l2_losses, test_l2_losses
